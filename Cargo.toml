@@ -1,0 +1,16 @@
+[package]
+name = "xspeed"
+version = "0.1.0"
+authors = ["Jonathan Strong <jstrong@tioscapital.com>"]
+edition = "2018"
+
+[dependencies]
+xgboost = "0.1"
+rand = "0.6"
+crossbeam-deque = "0.7"
+clap = "2.32"
+slog = "2"
+slog-term = "2"
+slog-async = "2"
+num_cpus = "1.10"
+pretty_toa = "1"
