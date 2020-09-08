@@ -1,5 +1,4 @@
-#![feature(try_from)]
-#![feature(duration_float)]
+#![feature(div_duration)]
 
 #[macro_use]
 extern crate slog;
@@ -26,6 +25,12 @@ pub fn usize_validator(s: String) -> Result<(), String> {
     }).map(|_| ())
 }
 
+pub fn u32_validator(s: String) -> Result<(), String> {
+    u32::from_str(&s).map_err(|e| {
+        format!("failed to parse integer (u32): {} (input was '{}')", e, s)
+    }).map(|_| ())
+}
+
 pub fn isize_validator(s: String) -> Result<(), String> {
     isize::from_str(&s).map_err(|e| {
         format!("failed to parse integer (isize): {} (input was '{}')", e, s)
@@ -44,7 +49,7 @@ fn parse_n_threads(n: isize) -> Result<usize, String> {
 pub fn per_sec(n: usize, span: Duration) -> f64 {
     if n == 0 || span < Duration::from_micros(1) { return 0.0 }
     Duration::from_secs(1)
-        .div_duration(span / u32::try_from(n).unwrap_or(std::u32::MAX))
+        .div_duration_f64(span / u32::try_from(n).unwrap_or(std::u32::MAX))
 }
 
 impl Worker {
@@ -57,7 +62,9 @@ impl Worker {
         rx: deque::Stealer<Option<()>>,
         n_feat: usize,
         n_examples: usize,
-        n_xgboost_threads: usize,
+        n_xgboost_threads: u32,
+        n_boost_rounds: u32,
+        n_trees: Option<u32>,
         logger: &slog::Logger,
     ) -> Self {
         let logger = logger.new(o!(
@@ -79,14 +86,37 @@ impl Worker {
             let mut dmat = xgb::DMatrix::from_dense(&x[..], n_examples).expect("DMatrix::from_dense");
             dmat.set_labels(&y[..]).expect("DMatrix::set_labels");
 
-            let mut booster_params = xgb::parameters::BoosterParameters::default();
-            booster_params.set_threads(Some(n_xgboost_threads as u32));
-            booster_params.set_verbose(false);
+            let tree_params = match n_trees {
+                Some(n) => {
+                    xgboost::parameters::tree::TreeBoosterParametersBuilder::default()
+                        .tree_method(xgboost::parameters::tree::TreeMethod::Auto)
+                        .num_parallel_tree(n)
+                        .colsample_bynode(0.75)
+                        .eta(1.0)
+                        .max_depth(16)
+                        .subsample(0.75)
+                        .build()
+                        .unwrap()
+                }
+
+                None => {
+                    xgboost::parameters::tree::TreeBoosterParametersBuilder::default()
+                        .build()
+                        .unwrap()
+                }
+            };
+
+            let booster_params = xgboost::parameters::BoosterParametersBuilder::default()
+                .booster_type(xgboost::parameters::BoosterType::Tree(tree_params))
+                .threads(Some(n_xgboost_threads))
+                .build()
+                .unwrap();
 
             let training_params = xgb::parameters::TrainingParametersBuilder::default()
                 .dtrain(&dmat)
                 .evaluation_sets(None)
                 .booster_params(booster_params)
+                .boost_rounds(n_boost_rounds)
                 .build()
                 .unwrap();
 
@@ -164,6 +194,21 @@ fn main() -> Result<(), String> {
              .validator(usize_validator)
              .takes_value(true)
              .required(true))
+        .arg(clap::Arg::with_name("n-boost-rounds")
+             .long("n-boost-rounds")
+             .short("b")
+             .help("number of boost rounds")
+             .default_value("10")
+             .validator(u32_validator)
+             .takes_value(true)
+             .required(true))
+        .arg(clap::Arg::with_name("n-trees")
+             .long("n-trees")
+             .short("t")
+             .help("random forest mode: number of trees each model will train with")
+             .validator(u32_validator)
+             .takes_value(true)
+             .required(false))
         .get_matches();
 
     let decorator = slog_term::TermDecorator::new().stdout().force_color().build();
@@ -175,7 +220,9 @@ fn main() -> Result<(), String> {
     let n_feat = usize::from_str(args.value_of("n-features").unwrap()).unwrap(); // safe because input already validated with `validator(usize_validator)`
     let n_examples = usize::from_str(args.value_of("n-examples").unwrap()).unwrap();
     let n_threads = parse_n_threads(isize::from_str(args.value_of("n-threads").unwrap()).unwrap())?;
-    let n_xgboost_threads = parse_n_threads(isize::from_str(args.value_of("n-xgboost-threads").unwrap()).unwrap())?;
+    let n_xgboost_threads = parse_n_threads(isize::from_str(args.value_of("n-xgboost-threads").unwrap()).unwrap())? as u32;
+    let n_boost_rounds = u32::from_str(args.value_of("n-boost-rounds").unwrap()).unwrap();
+    let n_trees: Option<u32> = args.value_of("n-trees").map(|s| u32::from_str(s).unwrap());
     let n_jobs = usize::from_str(args.value_of("n-jobs").unwrap()).unwrap();
     info!(logger, "parsed opts, beginning work";
         "n_feat" => n_feat, "n_examples" => n_examples, "n_jobs" => n_jobs,
@@ -185,7 +232,7 @@ fn main() -> Result<(), String> {
     let queue = deque::Worker::new_fifo();
     let mut workers = Vec::new();
     for i in 0..n_threads {
-        workers.push(Worker::new(i, queue.stealer(), n_feat, n_examples, n_xgboost_threads, &logger));
+        workers.push(Worker::new(i, queue.stealer(), n_feat, n_examples, n_xgboost_threads, n_boost_rounds, n_trees, &logger));
     }
 
     info!(logger, "enqueueing jobs");
@@ -211,7 +258,8 @@ fn main() -> Result<(), String> {
 
     let took = Instant::now() - start;
     info!(logger, "finished in {:?}", Instant::now() - start;
-        "per_sec" => %format_args!("{}", (per_sec(n_jobs, took).round() as i64).thousands_sep()));
+        "jobs/sec" => %format_args!("{}", (per_sec(n_jobs, took).round() as i64).thousands_sep()),
+        "per job" => %format_args!("{:?}", took / n_jobs as u32));
 
     Ok(())
 }

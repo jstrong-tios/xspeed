@@ -1,11 +1,16 @@
 [package]
 name = "xspeed"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Jonathan Strong <jstrong@tioscapital.com>"]
 edition = "2018"
 
+[[bin]]
+name = "xspeed"
+path = "src/main.rs"
+
 [dependencies]
-xgboost = "0.1"
+xgboost = { git = "https://github.com/jstrong-tios/rust-xgboost", branch = "xgforest" }
+#xgboost = "0.1"
 rand = "0.6"
 crossbeam-deque = "0.7"
 clap = "2.32"
@@ -14,3 +19,10 @@ slog-term = "2"
 slog-async = "2"
 num_cpus = "1.10"
 pretty_toa = "1"
+
+[profile.release]
+lto = "fat"
+panic = "abort"
+incremental = false
+codegen-units = 1
+
